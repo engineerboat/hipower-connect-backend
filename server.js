@@ -16,11 +16,22 @@ const io = new Server(server, {
 });
 
 // =========================
-// SYSTEM STATE
+// GLOBAL STATE
 // =========================
-const reporters = new Map(); // code -> reporter group
-const sessions = new Map();  // socket.id -> code
-const socketToCode = new Map(); // socket.id -> code
+const reporters = new Map();   // code -> reporter object
+const sessions = new Map();    // socket.id -> code
+
+// =========================
+// HELPERS
+// =========================
+const getStudioState = () => ({
+  reporters: Object.fromEntries(reporters),
+  updatedAt: Date.now()
+});
+
+const broadcastState = () => {
+  io.emit("studio-state", getStudioState());
+};
 
 // =========================
 // HEALTH CHECK
@@ -30,98 +41,87 @@ app.get("/", (req, res) => {
 });
 
 // =========================
-// SOCKET CORE
+// SOCKET ENGINE
 // =========================
 io.on("connection", (socket) => {
+  console.log("Connected:", socket.id);
 
-  console.log(`Connected: ${socket.id}`);
+  // 🔥 send full state immediately on join
+  socket.emit("studio-state", getStudioState());
 
   // =========================
-  // REGISTER USER (CRITICAL FIX)
+  // REGISTER REPORTER
   // =========================
-socket.on("register-reporter", (data) => {
+  socket.on("register-reporter", (data) => {
+    const { code, name } = data || {};
+    if (!code) return;
 
-  const { code, name } = data || {};
-  if (!code) return;
+    sessions.set(socket.id, code);
 
-  sessions.set(socket.id, code);
+    const existing = reporters.get(code);
 
-  if (!reporters.has(code)) {
     reporters.set(code, {
       code,
-      name: name || "Reporter",
-      sockets: new Set()
+      name: name || existing?.name || "Reporter",
+      level: existing?.level || 0,
+      transmitting: existing?.transmitting || false,
+      connected: true,
+      sockets: new Set([
+        ...(existing?.sockets || []),
+        socket.id
+      ]),
+      lastSeen: Date.now()
     });
-  }
 
-  const reporter = reporters.get(code);
+    socket.emit("registered", { code, name });
 
-  reporter.name = name || reporter.name;
-  reporter.sockets.add(socket.id);
-
-  socket.emit("registered", {
-    code,
-    name: reporter.name
+    broadcastState();
   });
 
-  io.emit("reporter-joined", {
-    code,
-    name: reporter.name,
-    activeDevices: reporter.sockets.size
+  // =========================
+  // AUDIO STATUS (REALTIME HEARTBEAT)
+  // =========================
+  socket.on("audio-status", (data) => {
+    const code = sessions.get(socket.id);
+    if (!code || !reporters.has(code)) return;
+
+    const reporter = reporters.get(code);
+
+    reporters.set(code, {
+      ...reporter,
+      code,
+      name: reporter.name,
+      level: data?.level ?? 0,
+      transmitting: !!data?.transmitting,
+      connected: true,
+      lastSeen: Date.now()
+    });
+
+    broadcastState();
   });
-});
 
   // =========================
-  // AUDIO STATUS (FIXED ROUTING)
+  // GPS
   // =========================
-socket.on("audio-status", (data) => {
+  socket.on("gps-location", (location) => {
+    const code = sessions.get(socket.id);
+    if (!code) return;
 
-  const code = sessions.get(socket.id);
-
-  if (!code || !reporters.has(code)) return;
-
-  const reporter = reporters.get(code);
-
-  const payload = {
-    code,
-    name: reporter.name,
-    level: data.level,
-    connected: true,
-    transmitting: data.transmitting,
-    timestamp: Date.now(),
-    devices: reporter.sockets.size
-  };
-
-  console.log("📡 REPORTER STATUS:", payload);
-
-  io.emit("audio-status", payload);
-});
-
-  // =========================
-  // GPS LOCATION
-  // =========================
-socket.on("gps-location", (location) => {
-
-  const code = sessions.get(socket.id);
-  if (!code) return;
-
-  io.emit("gps-location", {
-    code,
-    location
+    io.emit("gps-location", { code, location });
   });
-});
+
   // =========================
-  // WEBRTC SIGNALING
+  // WEBRTC SIGNALING (FIXED NAMES)
   // =========================
-  socket.on("offer", (offer) => {
-    socket.broadcast.emit("offer", {
+  socket.on("webrtc-offer", (offer) => {
+    socket.broadcast.emit("webrtc-offer", {
       offer,
       from: socket.id
     });
   });
 
-  socket.on("answer", (answer) => {
-    socket.broadcast.emit("answer", {
+  socket.on("webrtc-answer", (answer) => {
+    socket.broadcast.emit("webrtc-answer", {
       answer,
       from: socket.id
     });
@@ -135,28 +135,24 @@ socket.on("gps-location", (location) => {
   });
 
   // =========================
-  // STUDIO COMMAND ENGINE (NEW CORE FEATURE)
+  // STUDIO COMMAND ENGINE
   // =========================
   socket.on("studio-command", (cmd) => {
-
     const target = cmd?.target;
 
-    // TARGETED COMMAND (SOLO / MUTE SINGLE REPORTER)
-if (target && reporters.has(target)) {
+    if (target && reporters.has(target)) {
+      const reporter = reporters.get(target);
 
-  const reporter = reporters.get(target);
+      for (const socketId of reporter.sockets) {
+        io.to(socketId).emit("studio-command", {
+          ...cmd,
+          from: socket.id
+        });
+      }
 
-  reporter.sockets.forEach((socketId) => {
-    io.to(socketId).emit("studio-command", {
-      ...cmd,
-      from: socket.id
-    });
-  });
+      return;
+    }
 
-  return;
-}
-
-    // GLOBAL COMMAND (MUTE ALL / PANIC CUT)
     io.emit("studio-command", {
       ...cmd,
       from: socket.id
@@ -164,59 +160,58 @@ if (target && reporters.has(target)) {
   });
 
   // =========================
-  // TALKBACK SYSTEM
+  // DISCONNECT HANDLING
   // =========================
-  socket.on("talkback", (data) => {
-    socket.broadcast.emit("talkback", {
-      ...data,
-      from: socket.id
-    });
+  socket.on("disconnect", () => {
+    const code = sessions.get(socket.id);
+
+    if (code && reporters.has(code)) {
+      const reporter = reporters.get(code);
+
+      reporter.sockets.delete(socket.id);
+
+      if (reporter.sockets.size === 0) {
+        reporters.delete(code);
+        io.emit("reporter-offline", { code });
+      } else {
+        reporters.set(code, reporter);
+      }
+    }
+
+    sessions.delete(socket.id);
+
+    broadcastState();
+
+    console.log("Disconnected:", socket.id);
   });
+});
 
-  // =========================
-  // DISCONNECT CLEANUP
-  // =========================
-socket.on("disconnect", () => {
+// =========================
+// HEARTBEAT CLEANER
+// =========================
+setInterval(() => {
+  const now = Date.now();
 
-  const code = sessions.get(socket.id);
+  let changed = false;
 
-  if (code && reporters.has(code)) {
-
-    const reporter = reporters.get(code);
-
-    reporter.sockets.delete(socket.id);
-
-    if (reporter.sockets.size === 0) {
-
-      reporters.delete(code);
-
-      io.emit("reporter-offline", {
-        code
+  for (const [code, reporter] of reporters.entries()) {
+    if (now - (reporter.lastSeen || 0) > 5000) {
+      reporters.set(code, {
+        ...reporter,
+        connected: false,
+        transmitting: false,
+        level: 0
       });
+      changed = true;
     }
   }
 
-  sessions.delete(socket.id);
-
-  console.log(`Disconnected: ${socket.id}`);
-});
-
-});
-
-// =========================
-// START SERVER (BOTTOM ONLY)
-// =========================
-// =========================
-// START SERVER (BOTTOM ONLY)
-// =========================
-
-setInterval(() => {
-  io.emit("server-heartbeat", {
-    time: Date.now(),
-    activeUsers: reporters.size
-  });
+  if (changed) broadcastState();
 }, 3000);
 
+// =========================
+// START SERVER
+// =========================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
