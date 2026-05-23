@@ -25,7 +25,20 @@ const sessions = new Map();    // socket.id -> code
 // HELPERS
 // =========================
 const getStudioState = () => ({
-  reporters: Object.fromEntries(reporters),
+  reporters: Object.fromEntries(
+    [...reporters.entries()].map(([code, r]) => [
+      code,
+      {
+        code: r.code,
+        name: r.name,
+        level: r.level || 0,
+        transmitting: !!r.transmitting,
+        connected: r.connected ?? true,
+        sockets: r.sockets?.size || 0,
+        lastSeen: r.lastSeen || 0
+      }
+    ])
+  ),
   updatedAt: Date.now()
 });
 
