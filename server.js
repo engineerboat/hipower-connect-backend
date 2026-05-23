@@ -95,23 +95,52 @@ io.on("connection", (socket) => {
   // AUDIO STATUS (REALTIME HEARTBEAT)
   // =========================
   socket.on("audio-status", (data) => {
-    const code = sessions.get(socket.id);
-    if (!code || !reporters.has(code)) return;
+  const code = sessions.get(socket.id);
+  if (!code || !reporters.has(code)) return;
 
-    const reporter = reporters.get(code);
+  const reporter = reporters.get(code);
 
-    reporters.set(code, {
-      ...reporter,
-      code,
-      name: reporter.name,
-      level: data?.level ?? 0,
-      transmitting: !!data?.transmitting,
-      connected: true,
-      lastSeen: Date.now()
-    });
+  // =========================
+  // 1. UPDATE INTERNAL STATE ONLY
+  // =========================
+  const updatedReporter = {
+    ...reporter,
+    code,
+    name: reporter.name,
+    level: data?.level ?? 0,
+    transmitting: !!data?.transmitting,
+    connected: true,
+    lastSeen: Date.now()
+  };
 
-    broadcastState();
+  reporters.set(code, updatedReporter);
+
+  // =========================
+  // 2. SEND LIGHTWEIGHT DELTA UPDATE (FAST LAYER)
+  // =========================
+  io.emit("audio-status", {
+    code,
+    level: updatedReporter.level,
+    transmitting: updatedReporter.transmitting,
+    connected: true,
+    lastSeen: updatedReporter.lastSeen
   });
+
+  // =========================
+  // 3. THROTTLED FULL STATE SYNC (SLOW LAYER)
+  // =========================
+  if (!reporter._lastBroadcast) {
+    reporter._lastBroadcast = Date.now();
+  }
+
+  const now = Date.now();
+
+  // only sync full state every 2 seconds max
+  if (now - reporter._lastBroadcast > 2000) {
+    reporter._lastBroadcast = now;
+    broadcastState();
+  }
+});
 
   // =========================
   // GPS
